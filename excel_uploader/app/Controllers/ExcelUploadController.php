@@ -3,7 +3,8 @@
 namespace App\Controllers;
 
 use App\Controllers\BaseController;
-use App\Models\TagDetailModel; // Will be created later
+use App\Models\TagDetailModel;
+use App\Models\StoneDetailModel; // Added for stone details
 use PhpOffice\PhpSpreadsheet\IOFactory;
 
 class ExcelUploadController extends BaseController
@@ -234,5 +235,230 @@ class ExcelUploadController extends BaseController
         }
 
         return redirect()->to('/excel');
+    }
+
+    // Methods for Stone Details Upload
+    public function stoneIndex()
+    {
+        // Log access to this new method
+        log_message('info', 'ExcelUploadController::stoneIndex() called.');
+        return view('stone_upload_form'); // New view for stone details
+    }
+
+    public function processStoneUpload()
+    {
+        // Increase execution time and memory limit
+        ini_set('max_execution_time', 300); // 5 minutes
+        ini_set('memory_limit', '1024M'); // As per user request
+
+        $file = $this->request->getFile('excel_file'); // Assuming same file input name
+        log_message('info', 'ExcelUploadController::processStoneUpload() started. File: ' . ($file ? $file->getName() : 'No file object'));
+        $session = session();
+
+        // 1. File Upload Validation (same as processUpload)
+        if (!$file || !$file->isValid()) {
+            if ($file && $file->getError() === UPLOAD_ERR_NO_FILE) {
+                $session->setFlashdata('error', 'Please select an Excel file for stone details to upload.');
+            } else {
+                $session->setFlashdata('error', 'Invalid file upload for stone details. Error: ' . ($file ? $file->getErrorString() : 'Unknown error') . ' (' . ($file ? $file->getError() : '') . ')');
+            }
+            return redirect()->to('/excel/stone'); // Redirect to stone upload form
+        }
+
+        if ($file->hasMoved()) {
+            $session->setFlashdata('error', 'File for stone details has already been moved. Cannot process.');
+            return redirect()->to('/excel/stone');
+        }
+        
+        $fileMimeType = $file->getMimeType();
+        $fileExtension = $file->getClientExtension();
+        $allowedMimeTypes = [
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+            'application/vnd.ms-excel', // .xls
+            'application/octet-stream'
+        ];
+        $allowedExtensions = ['xlsx', 'xls'];
+
+        if (!in_array(strtolower($fileExtension), $allowedExtensions) || !in_array($fileMimeType, $allowedMimeTypes, true)) {
+            if ($fileMimeType === 'application/octet-stream' && in_array(strtolower($fileExtension), $allowedExtensions)) {
+                log_message('info', 'Stone details file uploaded with octet-stream type but correct extension: ' . $file->getName());
+            } else {
+                $session->setFlashdata('error', 'Invalid file type for stone details. Only .xlsx or .xls files are allowed. Uploaded type: '.$fileMimeType.' Ext: '.$fileExtension);
+                return redirect()->to('/excel/stone');
+            }
+        }
+
+        // 2. Excel File Parsing (same logic as processUpload)
+        $dataToInsert = [];
+        try {
+            log_message('info', 'Attempting to parse stone details Excel file: ' . $file->getName() . ' (Temp path: ' . $file->getTempName() . ')');
+            $spreadsheet = IOFactory::load($file->getTempName());
+            $worksheet = $spreadsheet->getActiveSheet();
+            
+            $headerRow = [];
+            $firstRow = $worksheet->getRowIterator()->current();
+            foreach ($firstRow->getCellIterator() as $cell) {
+                $headerValue = trim((string)$cell->getValue());
+                if (!empty($headerValue)) {
+                    $headerRow[] = $headerValue;
+                }
+            }
+
+            if (empty($headerRow)) {
+                $session->setFlashdata('error', 'Stone details Excel file is empty or header row could not be read.');
+                return redirect()->to('/excel/stone');
+            }
+
+            $rows = $worksheet->getRowIterator();
+            $isFirstRow = true;
+
+            foreach ($rows as $row) {
+                if ($isFirstRow) {
+                    $isFirstRow = false;
+                    continue;
+                }
+                $rowData = [];
+                $cellIterator = $row->getCellIterator();
+                $cellIterator->setIterateOnlyExistingCells(false);
+                $colIndex = 0;
+                $emptyRow = true;
+                foreach ($cellIterator as $cell) {
+                    if ($colIndex < count($headerRow)) {
+                        $cellValue = $cell->getValue();
+                        $currentHeader = $headerRow[$colIndex];
+                        $rowData[$currentHeader] = $cellValue;
+                        if (!empty($cellValue)) {
+                            $emptyRow = false;
+                        }
+                    }
+                    $colIndex++;
+                    if ($colIndex >= count($headerRow)) break;
+                }
+                if (!$emptyRow) {
+                    $dataToInsert[] = $rowData;
+                }
+            }
+
+            if (empty($dataToInsert)) {
+                $session->setFlashdata('error', 'No data found in the stone details Excel file (after headers).');
+                return redirect()->to('/excel/stone');
+            }
+
+        } catch (\PhpOffice\PhpSpreadsheet\Reader\Exception $e) {
+            log_message('error', '[StoneUpload] Error reading Excel file: ' . $e->getMessage());
+            $session->setFlashdata('error', 'Could not read the stone details Excel file. It might be corrupted or not a valid Excel format.');
+            return redirect()->to('/excel/stone');
+        } catch (\Exception $e) {
+            log_message('error', '[StoneUpload] An unexpected error occurred during Excel processing: ' . $e->getMessage());
+            $session->setFlashdata('error', 'An unexpected error occurred while processing stone details. Please try again.');
+            return redirect()->to('/excel/stone');
+        }
+
+        // 3. Database Insertion for Stone Details (Manual SQL Row by Row)
+        log_message('info', '[StoneUpload] Excel parsing complete. Found ' . count($dataToInsert) . ' data rows to process.');
+        $totalRowsToInsert = count($dataToInsert);
+        $successfullyInsertedCount = 0;
+        $failedRows = 0;
+        $rowErrors = [];
+
+        if ($totalRowsToInsert > 0) {
+            $db = \Config\Database::connect();
+            $tableName = 'stone_details'; // Target table for stone details
+
+            log_message('info', '[StoneUpload] Starting database insertion loop for ' . $totalRowsToInsert . ' stone rows.');
+            foreach ($dataToInsert as $index => $rowData) {
+                log_message('debug', '[StoneUpload] Processing Excel row ' . ($index + 2) . ' for database insertion.');
+                $insertData = $rowData;
+
+                // Exclude 'sid' field if present, as it's auto-increment for stone_details
+                if (array_key_exists('sid', $insertData)) {
+                    unset($insertData['sid']);
+                }
+                 // Also check for common Excel import issue: if 'Tag Number' is primary linking key, ensure it's present
+                if (!isset($insertData['Tag Number']) || empty($insertData['Tag Number'])) {
+                    log_message('warning', '[StoneUpload] Skipping Excel row ' . ($index + 2) . ' due to missing or empty Tag Number.');
+                    $failedRows++;
+                    $rowErrors[] = 'Row ' . ($index + 2) . ' (Excel row) skipped: Missing or empty Tag Number.';
+                    continue;
+                }
+
+
+                if (empty($insertData)) {
+                    log_message('info', '[StoneUpload] Skipping empty row data at Excel row ' . ($index + 2) . ' after potential ID removal.');
+                    continue;
+                }
+
+                $fields = [];
+                $values = [];
+                foreach ($insertData as $key => $value) {
+                    $fields[] = "`" . str_replace("`", "``", trim((string)$key)) . "`";
+                    $values[] = $db->escape($value);
+                }
+
+                if (empty($fields)) { // Should not happen if $insertData was not empty
+                    log_message('warning', '[StoneUpload] No fields to insert for Excel row ' . ($index + 2));
+                    $failedRows++;
+                    $rowErrors[] = 'Row ' . ($index + 2) . ' (Excel row) resulted in no fields to insert.';
+                    continue;
+                }
+
+                $sql = "INSERT INTO `" . $tableName . "` (" . implode(', ', $fields) . ") VALUES (" . implode(', ', $values) . ")";
+                log_message('debug', '[StoneUpload] Manual SQL for Excel row ' . ($index + 2) . ': ' . $sql);
+                
+                try {
+                    if ($db->query($sql)) {
+                        if ($db->affectedRows() > 0) {
+                            $successfullyInsertedCount++;
+                            log_message('info', '[StoneUpload] Successfully inserted Excel row ' . ($index + 2) . '.');
+                        } else {
+                            $failedRows++;
+                            $errorMsg = '[StoneUpload] Row ' . ($index + 2) . ' (Excel row) executed but no rows affected.';
+                            $rowErrors[] = $errorMsg;
+                            log_message('warning', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true));
+                        }
+                    } else {
+                        $failedRows++;
+                        $dbError = $db->error();
+                        $errorMsg = '[StoneUpload] Row ' . ($index + 2) . ' (Excel row) failed: ' . ($dbError['message'] ?? 'Unknown database error');
+                        $rowErrors[] = $errorMsg;
+                        log_message('error', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true) . ' DB Error: ' . print_r($dbError, true));
+                    }
+                } catch (\Throwable $e) {
+                    $failedRows++;
+                    $errorMsg = '[StoneUpload] Row ' . ($index + 2) . ' (Excel row) failed with exception: ' . $e->getMessage();
+                    $rowErrors[] = $errorMsg;
+                    log_message('error', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true) . ' Exception: ' . $e->getMessage() . ' Trace: ' . $e->getTraceAsString());
+                }
+            }
+            log_message('info', '[StoneUpload] Database insertion loop finished. Successfully inserted: ' . $successfullyInsertedCount . ', Failed: ' . $failedRows . ' out of ' . $totalRowsToInsert . ' attempted.');
+
+            if ($successfullyInsertedCount > 0) {
+                $session->setFlashdata('success', $successfullyInsertedCount . ' out of ' . $totalRowsToInsert . ' stone data rows successfully imported.');
+            }
+            
+            if ($failedRows > 0) {
+                $existingError = $session->getFlashdata('error') ?? '';
+                $newErrorSummary = $failedRows . ' stone data rows failed to import or were not affected.';
+                if($successfullyInsertedCount > 0 && !empty($existingError)) {
+                     $session->setFlashdata('error', $existingError . '<br/>Additionally, ' . $newErrorSummary);
+                } elseif ($successfullyInsertedCount > 0 && empty($existingError)) {
+                    $currentSuccess = $session->getFlashdata('success');
+                    $session->setFlashdata('success', $currentSuccess . ($currentSuccess ? '<br/>' : '') . 'However, ' . $newErrorSummary);
+                } else {
+                     $session->setFlashdata('error', ($existingError ? $existingError . '<br/>' : '') . $newErrorSummary);
+                }
+                $session->setFlashdata('errors_list', $rowErrors);
+                log_message('error', '[StoneUpload] ' . $newErrorSummary . ' See previous log entries for details on each failed row.');
+            } elseif ($successfullyInsertedCount === 0 && $totalRowsToInsert > 0) {
+                if(empty($rowErrors)){
+                    $session->setFlashdata('info', 'No stone data rows were imported. All rows might have failed or were empty. Check logs.');
+                }
+            }
+
+        } else {
+            $session->setFlashdata('info', 'No processable stone data was extracted from the Excel file.');
+        }
+
+        return redirect()->to('/excel/stone'); // Redirect to stone upload form
     }
 }
