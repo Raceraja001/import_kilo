@@ -122,3 +122,71 @@ graph TD
     *   Display these messages clearly in the `excel_upload_form.php` view.
 
 This plan provides a structured approach to developing the Excel upload functionality.
+
+**Phase 6: Feature Enhancements (Post-Initial Implementation)**
+
+Based on further requirements, the following features will be added to enhance the application's capabilities:
+
+1.  **Dynamic Excel Column to Database Table Field Mapping:**
+    *   **Goal:** Allow users to upload Excel files where column names might not exactly match database field names or where the order might differ.
+    *   **Implementation:**
+        *   Modify the UI to allow users to select a target database table (from a predefined list or by discovering tables from `amman_basic.sql`).
+        *   After file upload, parse Excel headers.
+        *   Display Excel headers and database table columns side-by-side.
+        *   Provide a mapping interface (e.g., dropdowns) for the user to link each Excel column to a corresponding database field.
+        *   Store this mapping configuration (e.g., in session or a temporary table) for the current upload process.
+        *   The `processUpload()` method in `ExcelUploadController.php` will use this mapping to prepare data for insertion.
+
+2.  **Server-Side Upload and Batch Processing for All Excel Files:**
+    *   **Goal:** Handle uploads of multiple Excel files and process large files efficiently without browser timeouts or excessive memory usage.
+    *   **Implementation:**
+        *   Allow users to select multiple Excel files or a directory of files.
+        *   Files will be uploaded to a temporary server-side directory (e.g., `writable/uploads/excel_processing`).
+        *   Implement a queuing system or a background process (if feasible within CodeIgniter's scope or using cron jobs) to process these files one by one.
+        *   For each file, continue using `PhpSpreadsheet` for parsing.
+        *   Enhance the `insertBatchData()` method in `TagDetailModel.php` or create a new service to handle data insertion in smaller, manageable batches (e.g., 100-500 rows at a time) to prevent database overload and PHP memory limits.
+        *   Provide feedback to the user on the status of each file being processed (e.g., pending, processing, completed, error).
+
+3.  **Advanced Field Validations:**
+    *   **Goal:** Ensure data integrity by implementing robust validation rules beyond basic file checks.
+    *   **Implementation:**
+        *   **Configuration:** Store validation rules (e.g., in a configuration file, database table, or defined within the model/controller based on the selected target table).
+        *   **Field-Level Validation (Controller/Service):**
+            *   Not Null: Check for empty required fields based on the mapping.
+            *   Data Type: Validate if data matches the expected type (e.g., numeric, string, date format) for the mapped database column.
+            *   Length Constraints: Check min/max length for string fields.
+        *   **Regex Validation (Controller/Service):**
+            *   Allow defining regular expressions for specific fields (e.g., email format, specific ID patterns).
+            *   The mapping interface could allow users to specify regex patterns for certain columns or these could be predefined per table/field.
+        *   **Business Logic Validation (Controller/Service/Dedicated Validation Service):**
+            *   Implement custom validation rules that might involve cross-field checks (e.g., `start_date` must be before `end_date`).
+            *   Perform lookups in other database tables (from `amman_basic.sql`) to validate existence or consistency (e.g., `category_id` must exist in the `categories` table).
+        *   **Error Reporting:** Provide detailed error messages per row and per field, indicating which validation failed. Allow users to download an error report (e.g., an Excel file highlighting problematic rows/cells).
+
+4.  **User Interface (UI) / User Experience (UX) Enhancements:**
+    *   **Goal:** Improve the usability and feedback mechanisms of the application.
+    *   **Implementation:**
+        *   Clearer progress indicators during upload and processing.
+        *   Detailed success and error summaries after processing.
+        *   Option to download a report of imported data and any errors encountered.
+        *   A more intuitive interface for column mapping.
+
+5.  **Templating and Configuration Management:**
+    *   **Goal:** Allow administrators to predefine import templates for different Excel structures or target tables.
+    *   **Implementation:**
+        *   Create an interface to define and save import templates (table selection, column mappings, validation rules).
+        *   Users can then select a predefined template when uploading a file, simplifying the process.
+
+6.  **Data Transformation:**
+    *   **Goal:** Allow basic data transformations during the import process.
+    *   **Implementation:**
+        *   Provide options for simple transformations like changing case (uppercase, lowercase), trimming whitespace, or basic date format conversions, potentially configurable during the mapping phase.
+
+7.  **Enhanced Security:**
+    *   **Goal:** Ensure the application is secure.
+    *   **Implementation:**
+        *   Sanitize all inputs thoroughly.
+        *   Implement proper authorization if multiple users are expected.
+        *   Secure the file upload directory and process.
+
+This updated plan outlines the next steps for evolving the Excel uploader into a more robust and flexible data import utility.

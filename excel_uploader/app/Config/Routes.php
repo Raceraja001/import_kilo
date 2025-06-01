@@ -14,3 +14,7 @@ $routes->post('/excel/process', 'ExcelUploadController::processUpload');
 // Stone Details Excel uploader routes
 $routes->get('/excel/stone', 'ExcelUploadController::stoneIndex');
 $routes->post('/excel/stone/process', 'ExcelUploadController::processStoneUpload');
+
+// Dynamic Mapping routes
+$routes->get('/excel/map', 'ExcelUploadController::displayMappingForm');
+$routes->post('/excel/confirm_mapping', 'ExcelUploadController::confirmMapping');

@@ -128,110 +128,215 @@ class ExcelUploadController extends BaseController
             return redirect()->to('/excel');
         }
 
-        // 3. Database Insertion (Manual SQL Row by Row)
-        log_message('info', 'Excel parsing complete. Found ' . count($dataToInsert) . ' data rows to process for database insertion.');
-        $totalRowsToInsert = count($dataToInsert);
-        $successfullyInsertedCount = 0;
-        $failedRows = 0;
-        $rowErrors = []; // Store errors for specific rows
+        // --- Start: Added for Dynamic Mapping (Step 1) ---
+        $dbForMapping = \Config\Database::connect();
+        $currentTableName = 'tag_details'; // Target table for this method
+        
+        if ($dbForMapping->tableExists($currentTableName)) {
+            $dbFields = $dbForMapping->getFieldNames($currentTableName);
+            log_message('info', '[PROCESS_UPLOAD] Database columns for table "' . $currentTableName . '": ' . implode(', ', $dbFields));
+        } else {
+            log_message('error', '[PROCESS_UPLOAD] Target table for mapping "' . $currentTableName . '" does not exist.');
+            // Consider setting a flash error and redirecting if table non-existence is critical here
+        }
+        log_message('info', '[PROCESS_UPLOAD] Excel headers found: ' . implode(', ', $headerRow));
+        // --- End: Added for Dynamic Mapping (Step 1) ---
 
-        if ($totalRowsToInsert > 0) {
-            $db = \Config\Database::connect(); // Get default database connection
-            $tableName = 'tag_details'; // Define table name
+        // Store file temporarily and redirect to mapping form
+        $tempFilePath = WRITEPATH . 'uploads/' . $file->getName();
+        $file->move(WRITEPATH . 'uploads', $file->getName()); // Move the uploaded file to writable/uploads
 
-            log_message('info', 'Starting database insertion loop for ' . $totalRowsToInsert . ' rows.');
-            foreach ($dataToInsert as $index => $rowData) {
-                log_message('debug', 'Processing Excel row ' . ($index + 2) . ' for database insertion.'); // +2 because $index is 0-based and 1st Excel row is header
-                $insertData = $rowData; // Make a copy
+        $session->setFlashdata('excelHeaders', $headerRow);
+        $session->setFlashdata('uploadedFilePath', $tempFilePath);
+        $session->setFlashdata('targetTable', 'tag_details'); // Indicate target table
 
-                // Exclude 'id' field if present, as it's auto-increment
-                // Check if 'id' key exists and if its value suggests it's a placeholder from Excel (e.g., numeric)
-                // For robust check, ensure it's not a meaningful ID if updates were ever intended.
-                // For this import, we assume new records, so any 'id' from Excel is ignored.
-                if (array_key_exists('id', $insertData)) {
-                    unset($insertData['id']);
+        return redirect()->to('/excel/map'); // Redirect to the new mapping route
+    }
+
+    public function displayMappingForm()
+    {
+        $session = session();
+        $excelHeaders = $session->getFlashdata('excelHeaders');
+        $uploadedFilePath = $session->getFlashdata('uploadedFilePath');
+        $tableName = $session->getFlashdata('targetTable');
+
+        if (!$excelHeaders || !$uploadedFilePath || !$tableName) {
+            $session->setFlashdata('error', 'No Excel file or mapping data found. Please upload a file first.');
+            return redirect()->to('/excel');
+        }
+
+        $db = \Config\Database::connect();
+        $dbColumns = [];
+        if ($db->tableExists($tableName)) {
+            $dbColumns = $db->getFieldNames($tableName);
+        } else {
+            $session->setFlashdata('error', 'Target database table "' . esc($tableName) . '" does not exist.');
+            return redirect()->to('/excel');
+        }
+
+        $data = [
+            'excelHeaders' => $excelHeaders,
+            'dbColumns' => $dbColumns,
+            'tableName' => $tableName,
+            'uploadedFilePath' => $uploadedFilePath,
+        ];
+
+        return view('mapping_form', $data);
+    }
+
+    public function confirmMapping()
+    {
+        // Increase execution time and memory limit for potentially large files/operations
+        ini_set('max_execution_time', 300); // 300 seconds = 5 minutes
+        ini_set('memory_limit', '1024M'); // Increased memory limit as per request
+
+        $session = session();
+        $request = $this->request;
+
+        $mapping = $request->getPost('mapping');
+        $targetTable = $request->getPost('target_table');
+        $uploadedFilePath = $request->getPost('uploaded_file_path');
+        $originalExcelHeadersJson = $request->getPost('original_excel_headers');
+        $originalExcelHeaders = json_decode($originalExcelHeadersJson, true);
+
+        if (!$mapping || !$targetTable || !$uploadedFilePath || !file_exists($uploadedFilePath) || !$originalExcelHeaders) {
+            $session->setFlashdata('error', 'Invalid mapping submission or file not found. Please try again.');
+            return redirect()->to('/excel');
+        }
+
+        $dataToInsert = [];
+        try {
+            $spreadsheet = IOFactory::load($uploadedFilePath);
+            $worksheet = $spreadsheet->getActiveSheet();
+            
+            $rows = $worksheet->getRowIterator();
+            $isFirstRow = true;
+
+            foreach ($rows as $row) {
+                if ($isFirstRow) {
+                    $isFirstRow = false;
+                    continue; // Skip header row
                 }
 
-                if (empty($insertData)) {
-                    log_message('info', 'Skipping empty row data at Excel row ' . ($index + 2) . ' after potential ID removal.');
-                    // $failedRows++; // Optionally count this as a failed/skipped row
-                    // $rowErrors[] = 'Row ' . ($index + 2) . ' (Excel row) was empty after ID removal.';
-                    continue;
-                }
+                $rowData = [];
+                $cellIterator = $row->getCellIterator();
+                $cellIterator->setIterateOnlyExistingCells(false);
 
-                $fields = [];
-                $values = [];
-                foreach ($insertData as $key => $value) {
-                    // Ensure correct quoting for field names (keys)
-                    $fields[] = "`" . str_replace("`", "``", trim((string)$key)) . "`";
-                    // Ensure correct escaping for values
-                    $values[] = $db->escape($value);
-                }
-
-                $sql = "INSERT INTO `" . $tableName . "` (" . implode(', ', $fields) . ") VALUES (" . implode(', ', $values) . ")";
-                log_message('debug', 'Manual SQL for Excel row ' . ($index + 2) . ': ' . $sql);
-                
-                try {
-                    if ($db->query($sql)) {
-                        if ($db->affectedRows() > 0) {
-                            $successfullyInsertedCount++;
-                            log_message('info', 'Successfully inserted Excel row ' . ($index + 2) . '.');
-                        } else {
-                            // Query executed but no rows affected - could be an issue or an empty valid insert
-                            $failedRows++;
-                            $errorMsg = 'Row ' . ($index + 2) . ' (Excel row) executed but no rows affected.';
-                            $rowErrors[] = $errorMsg;
-                            log_message('warning', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true));
+                $colIndex = 0;
+                $emptyRow = true;
+                foreach ($cellIterator as $cell) {
+                    if ($colIndex < count($originalExcelHeaders)) {
+                        $excelHeader = $originalExcelHeaders[$colIndex];
+                        $dbColumn = $mapping[$excelHeader] ?? null; // Get mapped DB column
+                        
+                        if (!empty($dbColumn)) { // Only include if mapped and not 'Do Not Import'
+                            $cellValue = $cell->getValue();
+                            $rowData[$dbColumn] = $cellValue;
+                            if (!empty($cellValue)) {
+                                $emptyRow = false;
+                            }
                         }
-                    } else {
-                        $failedRows++;
-                        $dbError = $db->error(); // Get error info from the connection
-                        $errorMsg = 'Row ' . ($index + 2) . ' (Excel row) failed: ' . ($dbError['message'] ?? 'Unknown database error');
-                        $rowErrors[] = $errorMsg;
-                        log_message('error', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true) . ' DB Error: ' . print_r($dbError, true));
                     }
-                } catch (\Throwable $e) {
-                    $failedRows++;
-                    $errorMsg = 'Row ' . ($index + 2) . ' (Excel row) failed with exception: ' . $e->getMessage();
-                    $rowErrors[] = $errorMsg;
-                    log_message('error', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true) . ' Exception: ' . $e->getMessage() . ' Trace: ' . $e->getTraceAsString());
+                    $colIndex++;
+                    if ($colIndex >= count($originalExcelHeaders)) break;
+                }
+                
+                if (!$emptyRow) {
+                    $dataToInsert[] = $rowData;
                 }
             }
-            log_message('info', 'Database insertion loop finished. Successfully inserted: ' . $successfullyInsertedCount . ', Failed: ' . $failedRows . ' out of ' . $totalRowsToInsert . ' attempted.');
+
+            // Clean up the temporary file after processing
+            unlink($uploadedFilePath);
+
+            if (empty($dataToInsert)) {
+                $session->setFlashdata('error', 'No data found in the Excel file after applying mapping.');
+                return redirect()->to('/excel');
+            }
+
+        } catch (\PhpOffice\PhpSpreadsheet\Reader\Exception $e) {
+            log_message('error', 'Error re-reading Excel file for mapping confirmation: ' . $e->getMessage());
+            $session->setFlashdata('error', 'Could not re-read the Excel file for import. It might be corrupted or not a valid Excel format.');
+            return redirect()->to('/excel');
+        } catch (\Exception $e) {
+            log_message('error', 'An unexpected error occurred during mapping confirmation processing: ' . $e->getMessage());
+            $session->setFlashdata('error', 'An unexpected error occurred during mapping confirmation. Please try again.');
+            return redirect()->to('/excel');
+        }
+
+        // Perform batch insertion based on target table
+        $successfullyInsertedCount = 0;
+        $totalRowsToInsert = count($dataToInsert);
+        $failedRows = 0;
+
+        try {
+            if ($targetTable === 'tag_details') {
+                $model = new TagDetailModel();
+                // Filter out 'id' for tag_details
+                $filteredDataToInsert = array_map(function($row) {
+                    if (array_key_exists('id', $row)) {
+                        unset($row['id']);
+                    }
+                    return $row;
+                }, $dataToInsert);
+                $filteredDataToInsert = array_filter($filteredDataToInsert, function($row) { return !empty($row); });
+                $successfullyInsertedCount = $model->insertBatchData($filteredDataToInsert);
+
+            } elseif ($targetTable === 'stone_details') {
+                $model = new StoneDetailModel();
+                // Filter out 'sid' and validate 'Tag Number' for stone_details
+                $filteredDataToInsert = array_map(function($row) {
+                    if (array_key_exists('sid', $row)) {
+                        unset($row['sid']);
+                    }
+                    if (!isset($row['Tag Number']) || empty($row['Tag Number'])) {
+                        log_message('warning', '[StoneUpload] Skipping row due to missing or empty Tag Number during mapped import.');
+                        return null;
+                    }
+                    return $row;
+                }, $dataToInsert);
+                $filteredDataToInsert = array_filter($filteredDataToInsert);
+                $successfullyInsertedCount = $model->insertBatchData($filteredDataToInsert);
+            } else {
+                $session->setFlashdata('error', 'Invalid target table specified for import.');
+                return redirect()->to('/excel');
+            }
+
+            if ($successfullyInsertedCount === false) {
+                $db = \Config\Database::connect();
+                $dbError = $db->error();
+                $errorMsg = 'Database batch insertion failed for ' . $targetTable . ': ' . ($dbError['message'] ?? 'Unknown database error');
+                log_message('error', $errorMsg . ' DB Error: ' . print_r($dbError, true));
+                $session->setFlashdata('error', 'Failed to import data due to a database error. Please check logs for details.');
+                return redirect()->to('/excel');
+            }
+
+            $failedRows = $totalRowsToInsert - $successfullyInsertedCount;
 
             if ($successfullyInsertedCount > 0) {
-                $session->setFlashdata('success', $successfullyInsertedCount . ' out of ' . $totalRowsToInsert . ' data rows successfully imported.');
+                $session->setFlashdata('success', $successfullyInsertedCount . ' out of ' . $totalRowsToInsert . ' data rows successfully imported into ' . $targetTable . '.');
             }
             
             if ($failedRows > 0) {
-                $existingError = $session->getFlashdata('error') ?? ''; // Preserve any previous general error
-                $newErrorSummary = $failedRows . ' data rows failed to import or were not affected.';
-                // If there was a success message, clear it if there were also failures, or append.
+                $existingError = $session->getFlashdata('error') ?? '';
+                $newErrorSummary = $failedRows . ' data rows failed to import or were not affected for ' . $targetTable . '.';
                 if($successfullyInsertedCount > 0 && !empty($existingError)) {
                      $session->setFlashdata('error', $existingError . '<br/>Additionally, ' . $newErrorSummary);
                 } elseif ($successfullyInsertedCount > 0 && empty($existingError)) {
-                    // If only success was set, and now we have errors, overwrite success with error summary or append to it.
-                    // For simplicity, let error summary take precedence or be appended.
                     $currentSuccess = $session->getFlashdata('success');
                     $session->setFlashdata('success', $currentSuccess . ($currentSuccess ? '<br/>' : '') . 'However, ' . $newErrorSummary);
-
                 } else {
                      $session->setFlashdata('error', ($existingError ? $existingError . '<br/>' : '') . $newErrorSummary);
                 }
-                $session->setFlashdata('errors_list', $rowErrors);
-                log_message('error', $newErrorSummary . ' See previous log entries for details on each failed row.');
+                log_message('error', $newErrorSummary . ' (Batch insert). Check database logs for more specific errors if available.');
             } elseif ($successfullyInsertedCount === 0 && $totalRowsToInsert > 0) {
-                if(empty($rowErrors)){
-                    $session->setFlashdata('info', 'No data rows were imported. All rows might have failed or were empty. Check logs.');
-                } else {
-                    // errors_list will be set if rowErrors had content, and error summary should also be set
-                     $session->setFlashdata('error', ($session->getFlashdata('error') ?? '') . ($failedRows > 0 ? '' : ' All rows failed. Check detailed errors.'));
-                }
+                $session->setFlashdata('info', 'No data rows were imported into ' . $targetTable . '. All rows might have failed or were empty. Check logs.');
             }
 
-        } else {
-            // This case means $dataToInsert was empty after parsing.
-            $session->setFlashdata('info', 'No processable data was extracted from the Excel file.');
+        } catch (\Throwable $e) {
+            log_message('error', 'Exception during batch insertion for ' . $targetTable . ': ' . $e->getMessage() . ' Trace: ' . $e->getTraceAsString());
+            $session->setFlashdata('error', 'An unexpected error occurred during database insertion for ' . $targetTable . '. Please try again.');
+            return redirect()->to('/excel');
         }
 
         return redirect()->to('/excel');
@@ -354,111 +459,14 @@ class ExcelUploadController extends BaseController
             return redirect()->to('/excel/stone');
         }
 
-        // 3. Database Insertion for Stone Details (Manual SQL Row by Row)
-        log_message('info', '[StoneUpload] Excel parsing complete. Found ' . count($dataToInsert) . ' data rows to process.');
-        $totalRowsToInsert = count($dataToInsert);
-        $successfullyInsertedCount = 0;
-        $failedRows = 0;
-        $rowErrors = [];
+        // Store file temporarily and redirect to mapping form for stone details
+        $tempFilePath = WRITEPATH . 'uploads/' . $file->getName();
+        $file->move(WRITEPATH . 'uploads', $file->getName());
 
-        if ($totalRowsToInsert > 0) {
-            $db = \Config\Database::connect();
-            $tableName = 'stone_details'; // Target table for stone details
+        $session->setFlashdata('excelHeaders', $headerRow);
+        $session->setFlashdata('uploadedFilePath', $tempFilePath);
+        $session->setFlashdata('targetTable', 'stone_details'); // Indicate target table
 
-            log_message('info', '[StoneUpload] Starting database insertion loop for ' . $totalRowsToInsert . ' stone rows.');
-            foreach ($dataToInsert as $index => $rowData) {
-                log_message('debug', '[StoneUpload] Processing Excel row ' . ($index + 2) . ' for database insertion.');
-                $insertData = $rowData;
-
-                // Exclude 'sid' field if present, as it's auto-increment for stone_details
-                if (array_key_exists('sid', $insertData)) {
-                    unset($insertData['sid']);
-                }
-                 // Also check for common Excel import issue: if 'Tag Number' is primary linking key, ensure it's present
-                if (!isset($insertData['Tag Number']) || empty($insertData['Tag Number'])) {
-                    log_message('warning', '[StoneUpload] Skipping Excel row ' . ($index + 2) . ' due to missing or empty Tag Number.');
-                    $failedRows++;
-                    $rowErrors[] = 'Row ' . ($index + 2) . ' (Excel row) skipped: Missing or empty Tag Number.';
-                    continue;
-                }
-
-
-                if (empty($insertData)) {
-                    log_message('info', '[StoneUpload] Skipping empty row data at Excel row ' . ($index + 2) . ' after potential ID removal.');
-                    continue;
-                }
-
-                $fields = [];
-                $values = [];
-                foreach ($insertData as $key => $value) {
-                    $fields[] = "`" . str_replace("`", "``", trim((string)$key)) . "`";
-                    $values[] = $db->escape($value);
-                }
-
-                if (empty($fields)) { // Should not happen if $insertData was not empty
-                    log_message('warning', '[StoneUpload] No fields to insert for Excel row ' . ($index + 2));
-                    $failedRows++;
-                    $rowErrors[] = 'Row ' . ($index + 2) . ' (Excel row) resulted in no fields to insert.';
-                    continue;
-                }
-
-                $sql = "INSERT INTO `" . $tableName . "` (" . implode(', ', $fields) . ") VALUES (" . implode(', ', $values) . ")";
-                log_message('debug', '[StoneUpload] Manual SQL for Excel row ' . ($index + 2) . ': ' . $sql);
-                
-                try {
-                    if ($db->query($sql)) {
-                        if ($db->affectedRows() > 0) {
-                            $successfullyInsertedCount++;
-                            log_message('info', '[StoneUpload] Successfully inserted Excel row ' . ($index + 2) . '.');
-                        } else {
-                            $failedRows++;
-                            $errorMsg = '[StoneUpload] Row ' . ($index + 2) . ' (Excel row) executed but no rows affected.';
-                            $rowErrors[] = $errorMsg;
-                            log_message('warning', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true));
-                        }
-                    } else {
-                        $failedRows++;
-                        $dbError = $db->error();
-                        $errorMsg = '[StoneUpload] Row ' . ($index + 2) . ' (Excel row) failed: ' . ($dbError['message'] ?? 'Unknown database error');
-                        $rowErrors[] = $errorMsg;
-                        log_message('error', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true) . ' DB Error: ' . print_r($dbError, true));
-                    }
-                } catch (\Throwable $e) {
-                    $failedRows++;
-                    $errorMsg = '[StoneUpload] Row ' . ($index + 2) . ' (Excel row) failed with exception: ' . $e->getMessage();
-                    $rowErrors[] = $errorMsg;
-                    log_message('error', $errorMsg . ' SQL: ' . $sql . ' Data: ' . print_r($rowData, true) . ' Exception: ' . $e->getMessage() . ' Trace: ' . $e->getTraceAsString());
-                }
-            }
-            log_message('info', '[StoneUpload] Database insertion loop finished. Successfully inserted: ' . $successfullyInsertedCount . ', Failed: ' . $failedRows . ' out of ' . $totalRowsToInsert . ' attempted.');
-
-            if ($successfullyInsertedCount > 0) {
-                $session->setFlashdata('success', $successfullyInsertedCount . ' out of ' . $totalRowsToInsert . ' stone data rows successfully imported.');
-            }
-            
-            if ($failedRows > 0) {
-                $existingError = $session->getFlashdata('error') ?? '';
-                $newErrorSummary = $failedRows . ' stone data rows failed to import or were not affected.';
-                if($successfullyInsertedCount > 0 && !empty($existingError)) {
-                     $session->setFlashdata('error', $existingError . '<br/>Additionally, ' . $newErrorSummary);
-                } elseif ($successfullyInsertedCount > 0 && empty($existingError)) {
-                    $currentSuccess = $session->getFlashdata('success');
-                    $session->setFlashdata('success', $currentSuccess . ($currentSuccess ? '<br/>' : '') . 'However, ' . $newErrorSummary);
-                } else {
-                     $session->setFlashdata('error', ($existingError ? $existingError . '<br/>' : '') . $newErrorSummary);
-                }
-                $session->setFlashdata('errors_list', $rowErrors);
-                log_message('error', '[StoneUpload] ' . $newErrorSummary . ' See previous log entries for details on each failed row.');
-            } elseif ($successfullyInsertedCount === 0 && $totalRowsToInsert > 0) {
-                if(empty($rowErrors)){
-                    $session->setFlashdata('info', 'No stone data rows were imported. All rows might have failed or were empty. Check logs.');
-                }
-            }
-
-        } else {
-            $session->setFlashdata('info', 'No processable stone data was extracted from the Excel file.');
-        }
-
-        return redirect()->to('/excel/stone'); // Redirect to stone upload form
+        return redirect()->to('/excel/map'); // Redirect to the new mapping route
     }
 }
